@@ -1,7 +1,17 @@
-require("torch")
-require("nn")
-require("image")
-require("paths")
+local torch = require("torch")
+local nn = require("nn")
+local image = require("image")
+local paths = require("paths")
+
+local assert = assert
+local loadfile = loadfile
+local math = math
+local pairs = pairs
+local print = print
+local setfenv = setfenv
+local unpack = unpack
+
+module("dream")
 
 -- Helper print function
 function printf(fmt, ...)
@@ -67,7 +77,9 @@ config = {
 
 if paths.filep("config.lua") then
 	printf("Loading config from config.lua...")
-	dofile("config.lua")
+	local configFunc = assert(loadfile("config.lua"))
+	setfenv(configFunc, config)
+	configFunc()
 end
 
 
@@ -461,34 +473,3 @@ function deepdream(options)
 	end
 	return deprocess(src)
 end
-
-net = torch.load(config.model_path)
-
-local src_image = arg[1] or config.input_file
-
-printf("Loading %s...", src_image)
-
-img = image.load(src_image)
-
-local W, H = img:size(3), img:size(2)
-
-if config.max_image_size and math.max(W, H) > config.max_image_size then
-	printf("Resizing %d x %d image...", W, H)
-	img = image.scale(img, config.max_image_size)
-	--local new_height = max_width / W * H
-	--img = image.scale(img, max_width, new_height, 'bilinear')
-	W, H = img:size(3), img:size(2)
-	printf("Resized to %d x %d", W, H)
-end
-
-image.display(img)
-
-out = deepdream({
-	net = net,
-	base_image = img
-})
-image.display(out)
-
-image.save(config.output_file, out)
-
-printf("Wrote to %s", config.output_file)
