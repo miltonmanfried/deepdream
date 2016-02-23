@@ -1,7 +1,19 @@
-require("torch")
-require("nn")
-require("image")
-require("paths")
+local torch = require("torch")
+local nn = require("nn")
+local image = require("image")
+local paths = require("paths")
+
+local assert = assert
+local io = io
+local loadfile = loadfile
+local math = math
+local ipairs = ipairs
+local pairs = pairs
+local print = print
+local setfenv = setfenv
+local unpack = unpack
+
+module("dream")
 
 -- Helper print function
 function printf(fmt, ...)
@@ -41,7 +53,7 @@ config = {
 	use_whole_image = false;
 
 	-- File to use if arg[1] is not provided
-	input_file = "sky1024px.jpg";
+	input_file = "input.jpg";
 
 	-- Final file is saved to output.jpg
 	output_file = "output.jpg";
@@ -67,7 +79,9 @@ config = {
 
 if paths.filep("config.lua") then
 	printf("Loading config from config.lua...")
-	dofile("config.lua")
+	local configFunc = assert(loadfile("config.lua"))
+	setfenv(configFunc, config)
+	configFunc()
 end
 
 
@@ -278,8 +292,12 @@ function make_step_whole_image(options)
 	local net = truncate_network(options.net, options.end_layer)
 	-- here we replace jitter by choosing a random INPUT_WIDTH x INPUT_HEIGHT sub-image to process.
 	local W, H = options.src:size(3), options.src:size(2)
-	local ox = math.random(0, 2 * options.jitter) - options.jitter
-	local oy = math.random(0, 2 * options.jitter) - options.jitter
+	local ox, oy
+	if options.jitter > 0 then
+		ox = math.random(1, options.jitter)
+		oy = math.random(1, options.jitter)
+		options.src = jitter(options.src, ox, oy)
+	end
 	-- Create a view of a single-image batch
 	local src = options.src:view(1, unpack(options.src:size():totable()))
 	net:evaluate()
@@ -296,13 +314,130 @@ function make_step_whole_image(options)
 	if clip then
 		clamp(src)
 	end
+	if options.jitter > 0 then
+		options.src = unjitter(options.src, ox, oy)
+	end
 
 	return options.src
 end
 
+-- simulating np.roll, which does a translation with wrap-around
+-- returns a copy
+-- TODO: support negative values
+function jitter(img, ox, oy)
+--[[
+		/----\		-\/---		8||567
+		|1234|		4||123		_/\___
+		|5678| ==>	8||567	==>	-\/---
+		\____/		_/\___		4||123
+--]]
+	local _, H, W = unpack(img:size():totable())
+	local topLeft = torch.Tensor(_, H - oy, W - ox)
+	local topRight = torch.Tensor(_, H - oy, ox)
+	local bottomLeft = torch.Tensor(_, oy, W - ox)
+	local bottomRight = torch.Tensor(_, oy, ox)
+	local ret = torch.Tensor(_, H, W):zero()
+	
+	topLeft[{}] = img[{{}, {1, H - oy }, { 1, W - ox }}]
+	topRight[{}] = img[{{}, {1, H - oy }, { W - ox + 1, W}}]
+	bottomLeft[{}] = img[{{}, {H - oy + 1, H}, {1, W - ox}}]
+	bottomRight[{}] = img[{{}, {H - oy + 1, H}, {W - ox + 1, W}}]
+	
+	-- top left to the bottom right, offset by ox, H - oy
+	ret[{{}, {oy + 1, H}, {ox + 1, W}}] = topLeft
+	-- top right to bottom left, offset by 0, H - oy
+	ret[{{}, {oy + 1, H}, {1, ox}}] = topRight
+	-- bottom left to top right, offset by ox, 0
+	ret[{{}, {1, oy}, {ox + 1, W}}] = bottomLeft
+	-- bottom right to top left, offset by 0, 0
+	ret[{{}, {1, oy}, {1, ox}}] = bottomRight
+
+	return ret
+end
+
+-- undoes jitter (returns a copy)
+function unjitter(img, ox, oy)
+--[[
+		/----\		-\/---		8||567
+		|1234|		4||123		_/\___
+		|5678| ==>	8||567	==>	-\/---
+		\____/		_/\___		4||123
+		
+		8||567		-\/---		/---*-\
+		_/\___		4||123		|123*4|
+		-\/--- ==>	~~~~~~	==> ~~~~~~~
+		4||123		8||567		|567*8|
+					-/\___		\---*-/
+--]]
+	local _, H, W = unpack(img:size():totable())
+	local topLeft = torch.Tensor(_, H - oy, W - ox)
+	local topRight = torch.Tensor(_, H - oy, ox)
+	local bottomLeft = torch.Tensor(_, oy, W - ox)
+	local bottomRight = torch.Tensor(_, oy, ox)
+	local ret = torch.Tensor(_, H, W):zero()
+	
+	topLeft[{}] = img[{{}, {oy + 1, H}, { ox + 1, W }}]
+	topRight[{}] = img[{{}, {oy + 1, H}, {1, ox}}]
+	bottomLeft[{}] = img[{{}, {1, oy}, {ox + 1, W}}]
+	bottomRight[{}] = img[{{}, {1, oy}, {1, ox}}]
+	
+	ret[{{}, {1, H - oy}, {1, W - ox}}] = topLeft
+	ret[{{}, {1, H - oy}, {W - ox + 1, W}}] = topRight
+	ret[{{}, {H - oy + 1, H}, {1, W - ox}}] = bottomLeft
+	ret[{{}, {H - oy + 1, H}, {W - ox + 1, W}}] = bottomRight
+	return ret
+end
+
+-- Get W/w * H/h random w*h-size segments of the image.
+local function getRandomChunks(t, w, h)
+	local W, H = t:size(3), t:size(2)
+	local max_ox = math.max(W - w, 1)
+	local max_oy = math.max(H - h, 1)
+	-- ensure that on average, we cover the whole image
+	local numJitterIter = math.ceil(W / w) * math.ceil(H / h)
+	local ret = {}
+	for i = 1, numJitterIter do
+		local ox = math.random(1, max_ox)
+		local oy = math.random(1, max_oy)
+		ret[#ret + 1] = {
+			x = ox,
+			y = oy
+		}
+	end
+	return ret
+end
+
+-- Get a set of w*h chunks that (approximately) span the image from top-left to bottom-right 
+local function getChunksArray(t, w, h, jitter)
+	jitter = jitter or 10
+    local W = t:size(3)
+    local H = t:size(2)
+    local ret = {}
+    local F = 1
+    local nw = math.ceil(W / w * F)
+    local nh = math.ceil(W / h * F)
+    for iy = 0, nh - 1 do
+		local sy = math.floor(iy * h * F) + 1
+		for ix = 0, nw - 1 do
+			local sx = math.floor(ix * w * F) + 1
+			local x = sx + math.random(-jitter, jitter)
+			local y = sy + math.random(-jitter, jitter)
+			ret[#ret + 1] = {
+				x = math.max(math.min(x, W - w), 1),
+				y = math.max(math.min(y, H - h), 1)
+			}
+		end
+    end
+    return ret
+end
+
+local function getChunks(t, w, h)
+	return getChunksArray(t, w, h)
+end
+
 --[[*
 	Basic gradient ascent step.
-	Run a series of steps on random 224x224 chunks of the image
+	Run gradient ascent on 224x224 chunks of the image.
 	@tparam table options named parameters
 	@tparam nn.Sequential options.net the network
 	@tparam Tensor[3][W][H] options.src the pre-processed image
@@ -318,7 +453,8 @@ function make_step_chunked(options)
 		step_size = 1.5,
 		end_layer = "inception_4c", -- note that nodes within the inception nodes are not addressable
 		clip = true,
-		objective = objective_L2
+		objective = objective_L2,
+		jitter = 32
 	}
 	for k, v in pairs(defaults) do
 		if options[k] == nil then
@@ -327,24 +463,31 @@ function make_step_chunked(options)
 	end
 	assert(options.net, "options.net is required")
 	assert(options.src, "options.src is required")
+	local jx, jy = 0, 0
+	if options.jitter > 0 then
+		jx = math.random(1, options.jitter)
+		jy = math.random(1, options.jitter)
+		options.src = jitter(options.src, jx, jy)
+	end
+
 	local net = truncate_network(options.net, options.end_layer)
 	-- here we replace jitter by choosing a random INPUT_WIDTH x INPUT_HEIGHT sub-image to process.
 	local W, H = options.src:size(3), options.src:size(2)
-	local max_ox = math.max(W - config.INPUT_WIDTH, 1)
-	local max_oy = math.max(H - config.INPUT_HEIGHT, 1)
-	-- ensure that on average, we cover the whole image
-	local numJitterIter = math.ceil(W / config.INPUT_WIDTH) * math.ceil(H / config.INPUT_HEIGHT)
-	
+
+	local chunks = getRandomChunks(options.src, config.INPUT_WIDTH, config.INPUT_HEIGHT)
+
 	-- buffer to store the sub-image deltas prior to adding them all at the end
-	local dImg = torch.Tensor(1, unpack(options.src:size():totable()))
-	for i = 1, numJitterIter do
-		local ox = math.random(1, max_ox)
-		local oy = math.random(1, max_oy)
-		local ex = math.min(ox + config.INPUT_WIDTH - 1, W)
-		local ey = math.min(oy + config.INPUT_HEIGHT - 1, H)
+	local dImg = torch.Tensor(1, unpack(options.src:size():totable())):zero()
+	for i, chunk in ipairs(chunks) do
+		local ox = chunk.x
+		local oy = chunk.y
+		local ex = chunk.x + config.INPUT_WIDTH - 1
+		local ey = chunk.y + config.INPUT_HEIGHT - 1
 		-- Create a view of a single-image batch
 		local batch_view = options.src:view(1, unpack(options.src:size():totable()))
 		-- Get the INPUT_WIDTH x INPUT_HEIGHT sub-image
+		ex = math.min(ex, W)
+		ey = math.min(ey, H)
 		local src = batch_view[{{},{},{oy, ey}, {ox, ex}}]
 		local dsrc = dImg[{{}, {}, {oy, ey}, {ox, ex}}]
 		-- Disable any dropout for the forward pass
@@ -358,6 +501,8 @@ function make_step_chunked(options)
 		local normalized = dL_d_src:mul(1/torch.abs(dL_d_src):mean())
 		normalized:mul(options.step_size)
 		
+		-- add the normalized dL/dInput to the proper section of the image
+
 		dsrc:add(normalized)
 
 		if clip then
@@ -365,6 +510,9 @@ function make_step_chunked(options)
 		end
 	end
 	options.src:add(dImg)
+	if options.jitter > 0 then
+		options.src = unjitter(options.src, jx, jy)
+	end
 	return options.src
 end
 
@@ -439,7 +587,7 @@ function deepdream(options)
 	local window
 	for octave = #octaves, 1, -1 do
 		local octave_base = octaves[octave]
-		local h, w = octave_base:size(3), octave_base:size(2)
+		local w, h = octave_base:size(3), octave_base:size(2)
 		if octave > 0 then
 			local h1, w1 = detail:size(3), detail:size(2)
 			--detail = badscale(detail, w, h)
@@ -450,6 +598,7 @@ function deepdream(options)
 		for i = 1, options.iter_n do
 			options.src = src
 			src = make_step(options)
+			--src = image.convolve(src, image.gaussian(3, 0.1), 'same')
 			config.vis_callback({
 				img = src,
 				i = i,
@@ -461,34 +610,3 @@ function deepdream(options)
 	end
 	return deprocess(src)
 end
-
-net = torch.load(config.model_path)
-
-local src_image = arg[1] or config.input_file
-
-printf("Loading %s...", src_image)
-
-img = image.load(src_image)
-
-local W, H = img:size(3), img:size(2)
-
-if config.max_image_size and math.max(W, H) > config.max_image_size then
-	printf("Resizing %d x %d image...", W, H)
-	img = image.scale(img, config.max_image_size)
-	--local new_height = max_width / W * H
-	--img = image.scale(img, max_width, new_height, 'bilinear')
-	W, H = img:size(3), img:size(2)
-	printf("Resized to %d x %d", W, H)
-end
-
-image.display(img)
-
-out = deepdream({
-	net = net,
-	base_image = img
-})
-image.display(out)
-
-image.save(config.output_file, out)
-
-printf("Wrote to %s", config.output_file)
