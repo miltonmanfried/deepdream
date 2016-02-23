@@ -4,6 +4,7 @@ local image = require("image")
 local paths = require("paths")
 
 local assert = assert
+local io = io
 local loadfile = loadfile
 local math = math
 local pairs = pairs
@@ -29,7 +30,7 @@ config = {
 
 	-- the reference model has channels in BGR order instead of RGB: Set this to true to swap the red/blue channels.
 	-- Setting this to false by default because its output with the sample image (output-rgb-chunked.jpg) looks most similar to the original deepdream output
-	use_bgr = false;
+	use_bgr = true;
 
 	imagenet_mean = { -- ImageNet mean, training set dependent (BGR order?)
 		104.0,
@@ -51,7 +52,7 @@ config = {
 	use_whole_image = false;
 
 	-- File to use if arg[1] is not provided
-	input_file = "sky1024px.jpg";
+	input_file = "input.jpg";
 
 	-- Final file is saved to output.jpg
 	output_file = "output.jpg";
@@ -312,6 +313,73 @@ function make_step_whole_image(options)
 	return options.src
 end
 
+-- simulating np.roll, which does a translation with wrap-around
+-- returns a copy
+-- TODO: support negative values
+function jitter(img, ox, oy)
+--[[
+		/----\		-\/---		8||567
+		|1234|		4||123		_/\___
+		|5678| ==>	8||567	==>	-\/---
+		\____/		_/\___		4||123
+--]]
+	local _, H, W = unpack(img:size():totable())
+	local topLeft = torch.Tensor(_, H - oy, W - ox)
+	local topRight = torch.Tensor(_, H - oy, ox)
+	local bottomLeft = torch.Tensor(_, oy, W - ox)
+	local bottomRight = torch.Tensor(_, oy, ox)
+	local ret = torch.Tensor(_, H, W):zero()
+	
+	topLeft[{}] = img[{{}, {1, H - oy }, { 1, W - ox }}]
+	topRight[{}] = img[{{}, {1, H - oy }, { W - ox + 1, W}}]
+	bottomLeft[{}] = img[{{}, {H - oy + 1, H}, {1, W - ox}}]
+	bottomRight[{}] = img[{{}, {H - oy + 1, H}, {W - ox + 1, W}}]
+	
+	-- top left to the bottom right, offset by ox, H - oy
+	ret[{{}, {oy + 1, H}, {ox + 1, W}}] = topLeft
+	-- top right to bottom left, offset by 0, H - oy
+	ret[{{}, {oy + 1, H}, {1, ox}}] = topRight
+	-- bottom left to top right, offset by ox, 0
+	ret[{{}, {1, oy}, {ox + 1, W}}] = bottomLeft
+	-- bottom right to top left, offset by 0, 0
+	ret[{{}, {1, oy}, {1, ox}}] = bottomRight
+
+	return ret
+end
+
+-- undoes jitter (returns a copy)
+function unjitter(img, ox, oy)
+--[[
+		/----\		-\/---		8||567
+		|1234|		4||123		_/\___
+		|5678| ==>	8||567	==>	-\/---
+		\____/		_/\___		4||123
+		
+		8||567		-\/---		/---*-\
+		_/\___		4||123		|123*4|
+		-\/--- ==>	~~~~~~	==> ~~~~~~~
+		4||123		8||567		|567*8|
+					-/\___		\---*-/
+--]]
+	local _, H, W = unpack(img:size():totable())
+	local topLeft = torch.Tensor(_, H - oy, W - ox)
+	local topRight = torch.Tensor(_, H - oy, ox)
+	local bottomLeft = torch.Tensor(_, oy, W - ox)
+	local bottomRight = torch.Tensor(_, oy, ox)
+	local ret = torch.Tensor(_, H, W):zero()
+	
+	topLeft[{}] = img[{{}, {oy + 1, H}, { ox + 1, W }}]
+	topRight[{}] = img[{{}, {oy + 1, H}, {1, ox}}]
+	bottomLeft[{}] = img[{{}, {1, oy}, {ox + 1, W}}]
+	bottomRight[{}] = img[{{}, {1, oy}, {1, ox}}]
+	
+	ret[{{}, {1, H - oy}, {1, W - ox}}] = topLeft
+	ret[{{}, {1, H - oy}, {W - ox + 1, W}}] = topRight
+	ret[{{}, {H - oy + 1, H}, {1, W - ox}}] = bottomLeft
+	ret[{{}, {H - oy + 1, H}, {W - ox + 1, W}}] = bottomRight
+	return ret
+end
+
 --[[*
 	Basic gradient ascent step.
 	Run a series of steps on random 224x224 chunks of the image
@@ -330,7 +398,8 @@ function make_step_chunked(options)
 		step_size = 1.5,
 		end_layer = "inception_4c", -- note that nodes within the inception nodes are not addressable
 		clip = true,
-		objective = objective_L2
+		objective = objective_L2,
+		jitter = 32
 	}
 	for k, v in pairs(defaults) do
 		if options[k] == nil then
@@ -339,6 +408,13 @@ function make_step_chunked(options)
 	end
 	assert(options.net, "options.net is required")
 	assert(options.src, "options.src is required")
+	local jx, jy = 0, 0
+	if options.jitter > 0 then
+		jx = math.random(1, options.jitter)
+		jy = math.random(1, options.jitter)
+		options.src = jitter(options.src, jx, jy)
+	end
+
 	local net = truncate_network(options.net, options.end_layer)
 	-- here we replace jitter by choosing a random INPUT_WIDTH x INPUT_HEIGHT sub-image to process.
 	local W, H = options.src:size(3), options.src:size(2)
@@ -348,7 +424,7 @@ function make_step_chunked(options)
 	local numJitterIter = math.ceil(W / config.INPUT_WIDTH) * math.ceil(H / config.INPUT_HEIGHT)
 	
 	-- buffer to store the sub-image deltas prior to adding them all at the end
-	local dImg = torch.Tensor(1, unpack(options.src:size():totable()))
+	local dImg = torch.Tensor(1, unpack(options.src:size():totable())):zero()
 	for i = 1, numJitterIter do
 		local ox = math.random(1, max_ox)
 		local oy = math.random(1, max_oy)
@@ -370,6 +446,8 @@ function make_step_chunked(options)
 		local normalized = dL_d_src:mul(1/torch.abs(dL_d_src):mean())
 		normalized:mul(options.step_size)
 		
+		-- add the normalized dL/dInput to the proper section of the image
+
 		dsrc:add(normalized)
 
 		if clip then
@@ -377,6 +455,9 @@ function make_step_chunked(options)
 		end
 	end
 	options.src:add(dImg)
+	if options.jitter > 0 then
+		options.src = unjitter(options.src, jx, jy)
+	end
 	return options.src
 end
 
